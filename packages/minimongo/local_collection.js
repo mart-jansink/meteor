@@ -6,6 +6,7 @@ import {
   isNumericKey,
   isOperatorObject,
   populateDocumentWithQueryFields,
+  markProjectionOperators,
   projectionDetails,
 } from './common.js';
 
@@ -826,7 +827,7 @@ LocalCollection._binarySearch = (cmp, array, value) => {
   return first;
 };
 
-LocalCollection._checkSupportedProjection = fields => {
+LocalCollection._checkSupportedProjection = (fields, forOplogObserver) => {
   if (fields !== Object(fields) || Array.isArray(fields)) {
     throw MinimongoError('fields option must be an object');
   }
@@ -840,13 +841,23 @@ LocalCollection._checkSupportedProjection = fields => {
 
     const value = fields[keyPath];
 
-    if (typeof value === 'object' &&
-        ['$elemMatch', '$meta', '$slice'].some(key =>
-          hasOwn.call(value, key)
-        )) {
-      throw MinimongoError(
-        'Minimongo doesn\'t support operators in projections yet.'
-      );
+    if (typeof value === 'object') {
+      const operator = Object.keys(value)[0];
+      switch (operator) {
+        case '$slice':
+          if (forOplogObserver && Array.isArray(value.$slice) && value.$slice[0] !== 0) {
+            throw MinimongoError(
+              'Minimongo doesn\'t support the $slice operator with non-idempotent arguments in projections for oplog observers yet.'
+            );
+          }
+          return;
+
+        case '$elemMatch':
+        case '$meta':
+          throw MinimongoError(
+            'Minimongo doesn\'t support the ' + operator + ' operator in projections yet.'
+          );
+      }
     }
 
     if (![1, 0, true, false].includes(value)) {
@@ -866,6 +877,7 @@ LocalCollection._checkSupportedProjection = fields => {
 //                       of passed argument.
 LocalCollection._compileProjection = fields => {
   LocalCollection._checkSupportedProjection(fields);
+  fields = markProjectionOperators(fields);
 
   const _idProjection = fields._id === undefined ? true : fields._id;
   const details = projectionDetails(fields);
@@ -880,6 +892,10 @@ LocalCollection._compileProjection = fields => {
     const result = details.including ? {} : EJSON.clone(doc);
 
     Object.keys(ruleTree).forEach(key => {
+      if (key[0] === '$') {
+        // Ignore any projection operators when transforming subdocuments.
+        return;
+      }
       if (!hasOwn.call(doc, key)) {
         return;
       }
@@ -887,9 +903,46 @@ LocalCollection._compileProjection = fields => {
       const rule = ruleTree[key];
 
       if (rule === Object(rule)) {
-        // For sub-objects/subsets we branch
-        if (doc[key] === Object(doc[key])) {
-          result[key] = transform(doc[key], rule);
+        switch (rule._operator) {
+          case "$slice":
+            let begin = 0;
+            let end;
+            const args = rule.$slice;
+            if (Array.isArray(args)) {
+              begin = args[0];
+              end = args[0] + args[1];
+              if (begin < 0 ) {
+                end += doc[key].length;
+              }
+            }
+            else if (args < 0) {
+              begin = args;
+            }
+            else {
+              end = args;
+            }
+
+            if (Object.keys(rule).length > 1) {
+              result[key] = transform(doc[key].slice(begin, end), rule);
+            }
+            else {
+              // Include all fields, regardless of the including flag, like
+              // Mongo does.
+              result[key] = EJSON.clone(doc[key].slice(begin, end));
+            }
+            break;
+
+          case undefined:
+            // For sub-objects/subsets we branch
+            if (doc[key] === Object(doc[key])) {
+              result[key] = transform(doc[key], rule);
+            }
+            break;
+
+          default:
+            throw MinimongoError(
+              'Minimongo doesn\'t support the ' + rule._operator + ' operator in projections yet.'
+            );
         }
       } else if (details.including) {
         // Otherwise we don't even touch this subfield

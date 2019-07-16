@@ -1287,6 +1287,26 @@ export function populateDocumentWithQueryFields(query, document = {}) {
   return document;
 }
 
+// Marks the (supported) operators on the fields for easy access, and cloning
+// the latter while doing so.
+export function markProjectionOperators(fields) {
+  const result = Object.create(null);
+  Object.keys(fields).forEach(keyPath => {
+    let value = fields[keyPath];
+
+    if (typeof value === 'object') {
+      const operator = Object.keys(value)[0];
+      value = Object.defineProperty({
+        [operator]: value[operator],
+      }, '_operator', {value: operator});
+    }
+
+    result[keyPath] = value;
+  });
+
+  return result;
+}
+
 // Traverses the keys of passed projection and constructs a tree where all
 // leaves are either all True or all False
 // @returns Object:
@@ -1313,14 +1333,20 @@ export function projectionDetails(fields) {
   let including = null; // Unknown
 
   fieldsKeys.forEach(keyPath => {
-    const rule = !!fields[keyPath];
+    const rule = fields[keyPath];
+
+    if (hasOwn.call(rule, '_operator')) {
+      // Rules with an operator can't determine whether or not we the fields are
+      // all including or not.
+      return;
+    }
 
     if (including === null) {
-      including = rule;
+      including = !!rule;
     }
 
     // This error message is copied from MongoDB shell
-    if (including !== rule) {
+    if (including !== !!rule) {
       throw MinimongoError(
         'You cannot currently mix including and excluding fields.'
       );
@@ -1329,7 +1355,14 @@ export function projectionDetails(fields) {
 
   const projectionRulesTree = pathsToTree(
     fieldsKeys,
-    path => including,
+    path => {
+      const operator = fields[path]
+      if (operator === Object(operator)) {
+        // Return the operator that we should support.
+        return operator;
+      }
+      return including;
+    },
     (node, path, fullPath) => {
       // Check passed projection fields' keys: If you have two rules such as
       // 'foo.bar' and 'foo.bar.baz', then the result becomes ambiguous. If

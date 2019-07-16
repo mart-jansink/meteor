@@ -4,6 +4,7 @@ import {
   isNumericKey,
   isOperatorObject,
   pathsToTree,
+  markProjectionOperators,
   projectionDetails,
 } from './common.js';
 
@@ -266,6 +267,7 @@ Minimongo.Sorter.prototype.combineIntoProjection = function(projection) {
 };
 
 function combineImportantPathsIntoProjection(paths, projection) {
+  projection = markProjectionOperators(projection);
   const details = projectionDetails(projection);
 
   // merge the paths to include
@@ -329,14 +331,21 @@ function pathHasNumericKeys(path) {
 }
 
 // Returns a set of key paths similar to
-// { 'foo.bar': 1, 'a.b.c': 1 }
-function treeToPaths(tree, prefix = '') {
+// { 'foo': { $slice: [1, 2] }, 'foo.bar': 1, 'a.b.c': 1 }
+function treeToPaths(tree, prefix = '', operator) {
   const result = {};
 
   Object.keys(tree).forEach(key => {
     const value = tree[key];
-    if (value === Object(value)) {
-      Object.assign(result, treeToPaths(value, `${prefix + key}.`));
+
+    if (key === operator) {
+      // Don't prefix this projection operator.
+      result[prefix.slice(0,-1)] = {
+        [key]: value
+      };
+    }
+    else if (value === Object(value)) {
+      Object.assign(result, treeToPaths(value, `${prefix}${key}.`, value._operator));
     } else {
       result[prefix + key] = value;
     }
