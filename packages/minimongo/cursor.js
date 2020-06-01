@@ -6,35 +6,87 @@ import { hasOwn } from './common.js';
 export default class Cursor {
   // don't call this ctor directly.  use LocalCollection.find().
   constructor(collection, selector, options = {}) {
-    this.collection = collection;
-    this.sorter = null;
-    this.matcher = new Minimongo.Matcher(selector);
-
-    if (LocalCollection._selectorIsIdPerhapsAsObject(selector)) {
-      // stash for fast _id and { _id }
-      this._selectorId = hasOwn.call(selector, '_id')
-        ? selector._id
-        : selector;
-    } else {
-      this._selectorId = undefined;
-
-      if (this.matcher.hasGeoQuery() || options.sort) {
-        this.sorter = new Minimongo.Sorter(options.sort || []);
-      }
-    }
-
-    this.skip = options.skip || 0;
-    this.limit = options.limit;
-    this.fields = options.fields;
-
-    this._projectionFn = LocalCollection._compileProjection(this.fields || {});
-
-    this._transform = LocalCollection.wrapTransform(options.transform);
-
     // by default, queries register w/ Tracker when it is available.
     if (typeof Tracker !== 'undefined') {
       this.reactive = options.reactive === undefined ? true : options.reactive;
     }
+
+    let existing;
+    if (this.reactive && Tracker.active) {
+      // Similar to how Meteor.subscribe handles re-subscribes: Is there an
+      // existing cursor with the same selector and options, run in an
+      // invalidated Computation?
+      Object.keys(collection.cursors).some(cid => {
+        const cursor = collection.cursors[cid];
+        if (cursor.inactive &&
+            EJSON.equals(cursor.selector, selector) &&
+            EJSON.equals(cursor.options, options)) {
+          return existing = cursor;
+        }
+      });
+    }
+
+    let cid;
+    let cursor;
+    if (existing) {
+      existing.inactive = false; // reactivate
+      cid = existing.id;
+      cursor = existing;
+    }
+    else {
+      cursor = this;
+      this.collection = collection;
+      this.sorter = null;
+      this.matcher = new Minimongo.Matcher(selector);
+
+      if (LocalCollection._selectorIsIdPerhapsAsObject(selector)) {
+        // stash for fast _id and { _id }
+        this._selectorId = hasOwn.call(selector, '_id')
+          ? selector._id
+          : selector;
+      } else {
+        this._selectorId = undefined;
+
+        if (this.matcher.hasGeoQuery() || options.sort) {
+          this.sorter = new Minimongo.Sorter(options.sort || []);
+        }
+      }
+
+      this.skip = options.skip || 0;
+      this.limit = options.limit;
+      this.fields = options.fields;
+
+      this._projectionFn = LocalCollection._compileProjection(this.fields || {});
+
+      this._transform = LocalCollection.wrapTransform(options.transform);
+
+      // qid -> live query object
+      this.queries = Object.create(null);
+
+      if (this.reactive && Tracker.active) {
+        this.selector = selector;
+        this.options = options;
+
+        cid = this.id = collection.next_cid++;
+        collection.cursors[cid] = this;
+      }
+    }
+
+    if (this.reactive && Tracker.active) {
+      // Again, similar to how Meteor.subscribe handles re-subscribes: determine
+      // if this cursor is reused and otherwise kill it from an afterFlush.
+      Tracker.onInvalidate(c => {
+        cursor.inactive = true;
+
+        Tracker.afterFlush(() => {
+          if (cursor.inactive) {
+            delete collection.cursors[cid];
+          }
+        });
+      });
+    }
+
+    return existing || this;
   }
 
   /**
@@ -206,7 +258,48 @@ export default class Cursor {
    *                           changes
    */
   observe(options) {
-    return LocalCollection._observeFromObserveChanges(this, options);
+    let existing;
+    if (this.reactive && Tracker.active) {
+      // Like above in the cursor's constructor
+      Object.keys(this.queries).some(qid => {
+        const query = this.queries[qid];
+        if (query.inactive &&
+            EJSON.equals(query.options, options)) {
+          return existing = query;
+        }
+      });
+    }
+
+    let query;
+    if (existing) {
+      existing.inactive = false; // reactivate
+      query = existing;
+
+      const qid = query.id;
+      if (this.reactive && Tracker.active) {
+        // Like above in the cursor's constructor
+        Tracker.onInvalidate(c => {
+          query.inactive = true;
+
+          if (c.stopped) {
+            query.handle.stop();
+          }
+          else {
+            Tracker.afterFlush(() => {
+              if (query.inactive) {
+                query.handle.stop();
+              }
+            });
+          }
+        });
+      }
+    }
+    else {
+      query = LocalCollection._observeFromObserveChanges(this, options).query;
+      query.options = options;
+    }
+
+    return query.handle;
   }
 
   /**
@@ -237,104 +330,135 @@ export default class Cursor {
       throw Error('You may not observe a cursor with {fields: {_id: 0}}');
     }
 
-    const distances = (
-      this.matcher.hasGeoQuery() &&
-      ordered &&
-      new LocalCollection._IdMap
-    );
-
-    const query = {
-      cursor: this,
-      dirty: false,
-      distances,
-      matcher: this.matcher, // not fast pathed
-      ordered,
-      projectionFn: this._projectionFn,
-      resultsSnapshot: null,
-      sorter: ordered && this.sorter
-    };
-
-    let qid;
-
-    // Non-reactive queries call added[Before] and then never call anything
-    // else.
-    if (this.reactive) {
-      qid = this.collection.next_qid++;
-      this.collection.queries[qid] = query;
-    }
-
-    query.results = this._getRawObjects({ordered, distances: query.distances});
-
-    if (this.collection.paused) {
-      query.resultsSnapshot = ordered ? [] : new LocalCollection._IdMap;
-    }
-
-    // wrap callbacks we were passed. callbacks only fire when not paused and
-    // are never undefined
-    // Filters out blacklisted fields according to cursor's projection.
-    // XXX wrong place for this?
-
-    // furthermore, callbacks enqueue until the operation we're working on is
-    // done.
-    const wrapCallback = fn => {
-      if (!fn) {
-        return () => {};
-      }
-
-      const self = this;
-      return function(/* args*/) {
-        if (self.collection.paused) {
-          return;
+    let existing;
+    if (this.reactive && Tracker.active) {
+      // Like above in the cursor's constructor
+      Object.keys(this.queries).some(qid => {
+        const query = this.queries[qid];
+        if (query.inactive &&
+            EJSON.equals(query.options, options)) {
+          return existing = query;
         }
-
-        const args = arguments;
-
-        self.collection._observeQueue.queueTask(() => {
-          fn.apply(this, args);
-        });
-      };
-    };
-
-    query.added = wrapCallback(options.added);
-    query.changed = wrapCallback(options.changed);
-    query.removed = wrapCallback(options.removed);
-
-    if (ordered) {
-      query.addedBefore = wrapCallback(options.addedBefore);
-      query.movedBefore = wrapCallback(options.movedBefore);
-    }
-
-    if (!options._suppress_initial && !this.collection.paused) {
-      query.results.forEach(doc => {
-        const fields = EJSON.clone(doc);
-
-        delete fields._id;
-
-        if (ordered) {
-          query.addedBefore(doc._id, this._projectionFn(fields), null);
-        }
-
-        query.added(doc._id, this._projectionFn(fields));
       });
     }
 
-    const handle = Object.assign(new LocalCollection.ObserveHandle, {
-      collection: this.collection,
-      stop: () => {
-        if (this.reactive) {
-          delete this.collection.queries[qid];
-        }
+    let qid;
+    let query;
+    if (existing) {
+      existing.inactive = false; // reactivate
+      qid = existing.id;
+      query = existing;
+    }
+    else {
+      const distances = (
+        this.matcher.hasGeoQuery() &&
+        ordered &&
+        new LocalCollection._IdMap
+      );
+
+      query = {
+        cursor: this,
+        dirty: false,
+        distances,
+        matcher: this.matcher, // not fast pathed
+        ordered,
+        projectionFn: this._projectionFn,
+        resultsSnapshot: null,
+        sorter: ordered && this.sorter
+      };
+
+      // Non-reactive queries call added[Before] and then never call anything
+      // else.
+      if (this.reactive) {
+        query.options = options;
+        query.inactive = false;
+
+        qid = query.id = this.collection.next_qid++;
+        this.queries[qid] = this.collection.queries[qid] = query;
       }
-    });
+
+      query.results = this._getRawObjects({ordered, distances: query.distances});
+
+      if (this.collection.paused) {
+        query.resultsSnapshot = ordered ? [] : new LocalCollection._IdMap;
+      }
+
+      // wrap callbacks we were passed. callbacks only fire when not paused and
+      // are never undefined
+      // Filters out blacklisted fields according to cursor's projection.
+      // XXX wrong place for this?
+
+      // furthermore, callbacks enqueue until the operation we're working on is
+      // done.
+      const wrapCallback = fn => {
+        if (!fn) {
+          return () => {};
+        }
+
+        const self = this;
+        return function(/* args*/) {
+          if (self.collection.paused) {
+            return;
+          }
+
+          const args = arguments;
+
+          self.collection._observeQueue.queueTask(() => {
+            fn.apply(this, args);
+          });
+        };
+      };
+
+      query.added = wrapCallback(options.added);
+      query.changed = wrapCallback(options.changed);
+      query.removed = wrapCallback(options.removed);
+
+      if (ordered) {
+        query.addedBefore = wrapCallback(options.addedBefore);
+        query.movedBefore = wrapCallback(options.movedBefore);
+      }
+
+      if (!options._suppress_initial && !this.collection.paused) {
+        query.results.forEach(doc => {
+          const fields = EJSON.clone(doc);
+
+          delete fields._id;
+
+          if (ordered) {
+            query.addedBefore(doc._id, this._projectionFn(fields), null);
+          }
+
+          query.added(doc._id, this._projectionFn(fields));
+        });
+      }
+
+      query.handle = Object.assign(new LocalCollection.ObserveHandle, {
+        collection: this.collection,
+        query,
+        stop: () => {
+          if (this.reactive) {
+            delete this.queries[qid];
+            delete this.collection.queries[qid];
+          }
+        }
+      });
+    }
 
     if (this.reactive && Tracker.active) {
-      // XXX in many cases, the same observe will be recreated when
-      // the current autorun is rerun.  we could save work by
-      // letting it linger across rerun and potentially get
-      // repurposed if the same observe is performed, using logic
-      // similar to that of Meteor.subscribe.
-      Tracker.onInvalidate(() => {
-        handle.stop();
+      // Like above in the cursor's constructor
+      Tracker.onInvalidate(c => {
+        query.inactive = true;
+
+        if (c.stopped) {
+          query.handle.stop();
+        }
+        else {
+          Tracker.afterFlush(() => {
+            if (query.inactive) {
+              query.handle.stop();
+            }
+          });
+        }
       });
     }
 
@@ -342,7 +466,7 @@ export default class Cursor {
     // before we leave the observe.
     this.collection._observeQueue.drain();
 
-    return handle;
+    return query.handle;
   }
 
   // Since we don't actually have a "nextObject" interface, there's really no

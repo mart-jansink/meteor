@@ -18,9 +18,11 @@ export default class LocalCollection {
     // _id -> document (also containing id)
     this._docs = new LocalCollection._IdMap;
 
-    this._observeQueue = new Meteor._SynchronousQueue();
+    // cid -> reactive cursor that can be reused in invalidated computations
+    this.cursors = Object.create(null);
+    this.next_cid = 1; // reactive cursor id generator
 
-    this.next_qid = 1; // live query id generator
+    this._observeQueue = new Meteor._SynchronousQueue();
 
     // qid -> live query object. keys:
     //  ordered: bool. ordered queries have addedBefore/movedBefore callbacks.
@@ -30,6 +32,7 @@ export default class LocalCollection {
     //  cursor: Cursor object for the query.
     //  selector, sorter, (callbacks): functions
     this.queries = Object.create(null);
+    this.next_qid = 1; // live query id generator
 
     // null if not saving originals; an IdMap from id to original document value
     // if saving originals. See comments before saveOriginals().
@@ -359,46 +362,48 @@ export default class LocalCollection {
     const docMap = new LocalCollection._IdMap;
     const idsMatched = LocalCollection._idsMatchedBySelector(selector);
 
-    Object.keys(this.queries).forEach(qid => {
-      const query = this.queries[qid];
+    if (!this.paused) {
+      Object.keys(this.queries).forEach(qid => {
+        const query = this.queries[qid];
 
-      if ((query.cursor.skip || query.cursor.limit) && ! this.paused) {
-        // Catch the case of a reactive `count()` on a cursor with skip
-        // or limit, which registers an unordered observe. This is a
-        // pretty rare case, so we just clone the entire result set with
-        // no optimizations for documents that appear in these result
-        // sets and other queries.
-        if (query.results instanceof LocalCollection._IdMap) {
-          qidToOriginalResults[qid] = query.results.clone();
-          return;
-        }
-
-        if (!(query.results instanceof Array)) {
-          throw new Error('Assertion failed: query.results not an array');
-        }
-
-        // Clones a document to be stored in `qidToOriginalResults`
-        // because it may be modified before the new and old result sets
-        // are diffed. But if we know exactly which document IDs we're
-        // going to modify, then we only need to clone those.
-        const memoizedCloneIfNeeded = doc => {
-          if (docMap.has(doc._id)) {
-            return docMap.get(doc._id);
+        if (query.cursor.skip || query.cursor.limit) {
+          // Catch the case of a reactive `count()` on a cursor with skip
+          // or limit, which registers an unordered observe. This is a
+          // pretty rare case, so we just clone the entire result set with
+          // no optimizations for documents that appear in these result
+          // sets and other queries.
+          if (query.results instanceof LocalCollection._IdMap) {
+            qidToOriginalResults[qid] = query.results.clone();
+            return;
           }
 
-          const docToMemoize = (
-            idsMatched &&
-            !idsMatched.some(id => EJSON.equals(id, doc._id))
-          ) ? doc : EJSON.clone(doc);
+          if (!(query.results instanceof Array)) {
+            throw new Error('Assertion failed: query.results not an array');
+          }
 
-          docMap.set(doc._id, docToMemoize);
+          // Clones a document to be stored in `qidToOriginalResults`
+          // because it may be modified before the new and old result sets
+          // are diffed. But if we know exactly which document IDs we're
+          // going to modify, then we only need to clone those.
+          const memoizedCloneIfNeeded = doc => {
+            if (docMap.has(doc._id)) {
+              return docMap.get(doc._id);
+            }
 
-          return docToMemoize;
-        };
+            const docToMemoize = (
+              idsMatched &&
+              !idsMatched.some(id => EJSON.equals(id, doc._id))
+            ) ? doc : EJSON.clone(doc);
 
-        qidToOriginalResults[qid] = query.results.map(memoizedCloneIfNeeded);
-      }
-    });
+            docMap.set(doc._id, docToMemoize);
+
+            return docToMemoize;
+          };
+
+          qidToOriginalResults[qid] = query.results.map(memoizedCloneIfNeeded);
+        }
+      });
+    }
 
     const recomputeQids = {};
 
