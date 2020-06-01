@@ -10,7 +10,7 @@ const hasOwn = Object.prototype.hasOwnProperty;
 // options.insert {Function(userId, doc)}
 //   return true to allow/deny adding this document
 //
-// options.update {Function(userId, docs, fields, modifier)}
+// options.update {Function(userId, docs, fields, modifier, options)}
 //   return true to allow/deny updating these documents.
 //   `fields` is passed as an array of fields that are to be modified
 //
@@ -334,7 +334,8 @@ CollectionPrototype._validatedUpdate = function(
     return validator(userId,
                      factoriedDoc,
                      fields,
-                     mutator);
+                     mutator,
+                     options);
   })) {
     throw new Meteor.Error(403, "Access denied");
   }
@@ -344,7 +345,8 @@ CollectionPrototype._validatedUpdate = function(
     return !validator(userId,
                       factoriedDoc,
                       fields,
-                      mutator);
+                      mutator,
+                      options);
   })) {
     throw new Meteor.Error(403, "Access denied");
   }
