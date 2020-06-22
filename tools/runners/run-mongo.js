@@ -400,7 +400,7 @@ var launchMongo = function (options) {
   var mongod_path = files.pathJoin(
     files.getDevBundle(), 'mongodb', 'bin', 'mongod'
   );
-  var replSetName = 'meteor';
+  var replSetName = (process.env.METEOR_MONGO_REPLICA_SET_NAME || 'meteor');
 
   // Automated testing: If this is set, instead of starting mongod, we
   // start our stub (fake-mongod) which can then be remote-controlled
